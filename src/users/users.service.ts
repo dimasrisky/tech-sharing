@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { BadRequestException, Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { performance } from 'node:perf_hooks';
 import { DataSource, Repository } from 'typeorm';
@@ -11,10 +11,10 @@ export interface BenchmarkResult {
   executionTime: string;
 }
 
-const CHUNK_SIZE = 200;
-
 @Injectable()
 export class UsersService {
+  private readonly logger = new Logger(UsersService.name);
+
   constructor(
     @InjectRepository(User)
     private readonly usersRepository: Repository<User>,
@@ -36,18 +36,29 @@ export class UsersService {
   async singleBulk(users: CreateUserDto[]): Promise<BenchmarkResult> {
     const start = performance.now();
 
-    await this.usersRepository
-      .createQueryBuilder()
-      .insert()
-      .into(User)
-      .values(users)
-      .execute();
+    try {
+      await this.usersRepository
+        .createQueryBuilder()
+        .insert()
+        .into(User)
+        .values(users)
+        .execute();
+    } catch (error) {
+      this.logger.error(`singleBulk gagal (${users.length} baris)`, error);
+      throw error;
+    }
 
     return this.result('Bulk Insert', users.length, start);
   }
 
   // Pendekatan 3: Batch/Chunked Bulk Insert dalam 1 transaksi (ceil(N/chunk) round-trip, atomik).
-  async batchChunk(users: CreateUserDto[]): Promise<BenchmarkResult> {
+  async batchChunk(
+    users: CreateUserDto[],
+    chunkSize = 200,
+  ): Promise<BenchmarkResult> {
+    if (chunkSize < 1) {
+      throw new BadRequestException('chunkSize harus >= 1');
+    }
     const start = performance.now();
 
     const queryRunner = this.dataSource.createQueryRunner();
@@ -55,8 +66,8 @@ export class UsersService {
     await queryRunner.startTransaction();
 
     try {
-      for (let i = 0; i < users.length; i += CHUNK_SIZE) {
-        const chunk = users.slice(i, i + CHUNK_SIZE);
+      for (let i = 0; i < users.length; i += chunkSize) {
+        const chunk = users.slice(i, i + chunkSize);
         await queryRunner.manager
           .createQueryBuilder()
           .insert()
@@ -68,6 +79,10 @@ export class UsersService {
       await queryRunner.commitTransaction();
     } catch (error) {
       await queryRunner.rollbackTransaction();
+      this.logger.error(
+        `batchChunk gagal (${users.length} baris, chunk ${chunkSize})`,
+        error,
+      );
       throw error;
     } finally {
       await queryRunner.release();
